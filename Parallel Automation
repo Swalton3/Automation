@@ -1,0 +1,345 @@
+from multiprocessing import Pool, Value
+import pandas as pd
+import cx_Oracle  
+import datetime
+import os 
+import time 
+import traceback
+import Disc_Repl_SQL as ds
+#import Functions as fn
+import sys
+now = datetime.datetime.now().strftime("%m/%d/%Y") 
+from multiprocessing import Pool
+#email api info from Azure must use app registration to get api access to outlook and excel for offline usage
+from O365 import Account
+credentials = (secret , key)
+account = Account(credentials)
+mailbox = account.mailbox()
+
+i = 0
+counter = Value('i', 0)
+#Logging Job Success into Oracle
+logsc = '''MERGE INTO logtable d
+USING (SELECT 'Report Name' DATASTAGE_JOB, sysdate LAST_SUCCESSFUL_RUN, sysdate LAST_UPDATE, 'SUCCESS' UPDATE_STATUS, 
+       'DAILY'FREQUENCY, 'M-F' EXPECTED_DAY, 9 EXPECTED_HOUR
+        from dual) s
+ON (d.ID = s.ID)
+WHEN MATCHED THEN UPDATE SET d.LAST_SUCCESSFUL_RUN = s.LAST_SUCCESSFUL_RUN,
+                             d.LAST_UPDATE = s.LAST_UPDATE,
+                             d.UPDATE_STATUS = s.UPDATE_STATUS
+WHEN NOT MATCHED THEN INSERT (DATASTAGE_JOB, LAST_SUCCESSFUL_RUN, LAST_UPDATE, UPDATE_STATUS, FREQUENCY,EXPECTED_DAY,EXPECTED_HOUR) 
+    VALUES (s.DATASTAGE_JOB, s.LAST_SUCCESSFUL_RUN, s.LAST_UPDATE, s.UPDATE_STATUS, s.FREQUENCY,s.EXPECTED_DAY,s.EXPECTED_HOUR)'''
+#Logging Job Failure into Oracle
+logfl = '''MERGE INTO logtable d
+USING (SELECT 'Report Name' DATASTAGE_JOB, sysdate LAST_UPDATE, 'FAILURE' UPDATE_STATUS, 
+       'DAILY'FREQUENCY, 'M-F' EXPECTED_DAY, 9 EXPECTED_HOUR
+        from dual) s
+ON (d.ID = s.ID)
+WHEN MATCHED THEN UPDATE SET d.LAST_UPDATE = s.LAST_UPDATE,
+                             d.UPDATE_STATUS = s.UPDATE_STATUS
+WHEN NOT MATCHED THEN INSERT (DATASTAGE_JOB, LAST_UPDATE, UPDATE_STATUS, FREQUENCY,EXPECTED_DAY,EXPECTED_HOUR) 
+    VALUES (s.DATASTAGE_JOB, s.LAST_UPDATE, s.UPDATE_STATUS, s.FREQUENCY,s.EXPECTED_DAY,s.EXPECTED_HOUR)'''
+	
+###Functions Below: 
+#append function
+def append_df_to_excel(filename, df, sheet_name='BO Report', startrow=None,
+                           truncate_sheet=False, 
+                           **to_excel_kwargs):
+        """
+        Append a DataFrame [df] to existing Excel file [filename]
+        into [sheet_name] Sheet.
+        If [filename] doesn't exist, then this function will create it.
+    
+        Parameters:
+          filename : File path or existing ExcelWriter
+                     (Example: '/path/to/file.xlsx')
+          df : dataframe to save to workbook
+          sheet_name : Name of sheet which will contain DataFrame.
+                       (default: 'Sheet1')
+          startrow : upper left cell row to dump data frame.
+                     Per default (startrow=None) calculate the last row
+                     in the existing DF and write to the next row...
+          truncate_sheet : truncate (remove and recreate) [sheet_name]
+                           before writing DataFrame to Excel file
+          to_excel_kwargs : arguments which will be passed to `DataFrame.to_excel()`
+                            [can be dictionary]
+    
+        Returns: None
+        """
+     
+        from openpyxl import load_workbook
+    
+        import pandas as pd
+    
+            # ignore [engine] parameter if it was passed
+        if 'engine' in to_excel_kwargs:
+                to_excel_kwargs.pop('engine')
+    
+        writer = pd.ExcelWriter(filename, engine='openpyxl')
+    
+            # Python 2.x: define [FileNotFoundError] exception if it doesn't exist 
+        try:
+                FileNotFoundError
+        except NameError:
+                FileNotFoundError = IOError
+    
+    
+        try:
+                # try to open an existing workbook
+                writer.book = load_workbook(filename)
+    
+                # get the last row in the existing Excel sheet
+                # if it was not specified explicitly
+                if startrow is None and sheet_name in writer.book.sheetnames:
+                    startrow = writer.book[sheet_name].max_row
+    
+                # truncate sheet
+                if truncate_sheet and sheet_name in writer.book.sheetnames:
+                    # index of [sheet_name] sheet
+                    idx = writer.book.sheetnames.index(sheet_name)
+                    # remove [sheet_name]
+                    writer.book.remove(writer.book.worksheets[idx])
+                    # create an empty sheet [sheet_name] using old index
+                    writer.book.create_sheet(sheet_name, idx)
+    
+                # copy existing sheets
+                writer.sheets = {ws.title:ws for ws in writer.book.worksheets}
+        except FileNotFoundError:
+                # file does not exist yet, we will create it
+                pass
+    
+        if startrow is None:
+                startrow = 0
+    
+            # write out the new sheet
+        df.to_excel(writer, sheet_name, startrow=startrow, **to_excel_kwargs, index= False, header= False)
+    
+            # save the workbook
+        writer.save()
+
+
+#update function
+#inputs SQL, connection, cursor, api account and mailbox
+def update_check(update_qry, conn, cur, account, mailbox):
+    import pandas as pd
+    import time 
+    import sys
+    u=0
+	#update sql
+	update_qry= '''Select Case when max(p.dt) <> trunc(sysdate) then 'Table Not Updated'
+                    when max(p.dt) = trunc(sysdate) then 'Table Updated' end EDW_Status
+                    from base_table b 
+                    join date_table p 
+                    on b.id = p.id'''
+    while True:
+        #Excute SQL
+        cur.execute(update_qry)
+        #Data Setup
+        columns = [desc[0] for desc in cur.description]
+        data = cur.fetchall()
+        df1 = pd.DataFrame(list(data), columns=columns)
+        s = df1['EDW_STATUS']
+        s[0]
+        if s[0] == 'Table Updated':
+            m = account.new_message()
+            m = mailbox.new_message()
+            m.sender.address = 'Emails'
+            m.to.add(['Emails'])
+            m.subject = 'Table updated'
+            m.body = 'Table updated. <br>' \
+                            'Starting report'
+            m.send()
+            print('Table Updated')
+            break
+        elif s[0] == 'Table Not Updated' and u <= 12:
+            u+=1
+            m = account.new_message()
+            m = mailbox.new_message()
+            m.sender.address = 'Emails'
+            m.to.add(['Emails'])
+            m.subject =  'Table not updated'
+            m.body = 'Table not updated. <br>' \
+                            'Rechecking in 1 hour'
+            m.send()
+            time.sleep(3600)
+        elif u == 13:
+            m = account.new_message()
+            m = mailbox.new_message()
+            m.sender.address = 'Emails'
+            m.to.add(['Emails'])
+            m.subject = 'Table didnt update after 12 attempts'
+            m.body = 'Table not updated(Runtime: '+ str(u) + 'H)' \
+                            'Table didnt update after 12 attempts'
+            m.send()
+            sys.exit("Table didnt update after 12 attempts")
+
+
+# Create file function by using customer list and report name
+def create_file(CustName, ReportName, Source, Path): 
+    import shutil
+    import pandas as pd
+    #import Funcations as bv
+    import datetime
+    now = datetime.datetime.now().strftime("%m/%d/%Y") #new
+    #Take Customer name and make new files. 
+    for N in (CustName):   
+        my_file = Path + str(N) +' ' + ReportName +'.xlsx'
+        shutil.copyfile(Source, my_file)  
+	#Format Excel
+        data = [[str(N) + ' Discontinuations',now]]  #new
+        rt = pd.DataFrame(data, columns = ['Name', 'Date'])  #new
+        append_df_to_excel(my_file, rt, sheet_name='Sheet1', truncate_sheet=False)
+#Example create_file(CustName, ReportName, Source, Path)
+
+
+#work_log function
+def insert_instance(Report_Name, Cust_Name, cur, conn):
+    """
+    Insert a row to the BO_WORK_LOG table
+    :param Report_Name:
+    :param Cust_Name:
+    :param Run_Date:
+    :param cur:
+    :param conn:
+    """
+    # construct an insert statement that add a new row to the BO_WORK_LOG table
+    #import cx_Oracle 
+    sql = ('insert into LOG (REPORT_NAME, CUST_NAME, RUN_DATE) '
+        'values(:Report_Name,:Cust_Name, sysdate)')
+    cur.execute(sql, [Report_Name, Cust_Name])
+    # commit work
+    conn.commit()	
+	
+
+#Run is Used to get the reporting list from Oracle tables
+#Zip the columns together to excute loop for each row
+def run():
+    global work
+    global st
+    global rc
+    #bv.update_check(bs.update_qry, conn, cur, account, mailbox)
+    time.sleep(1)
+    #Excute SQL
+    cur1.execute(ds.worksql)
+    #Data Setup
+    columns = [desc[0] for desc in cur1.description]
+    data = cur1.fetchall()
+    df1 = pd.DataFrame(list(data), columns=columns)
+    
+    print(df1.head(15))
+    
+    CustName = df1['Name'].tolist()
+    CustNums = df1['Cust Nums'].tolist()
+    EmailList = df1['Email'].tolist()
+    CCList = df1['CC'].tolist()
+    work = zip(CustName, CustNums, EmailList, CCList)
+	#source is used as a template
+    Source = r'D:\ProgramData\Task\Disc_Repl\Files\template.xlsx'
+    Path = r'D:\ProgramData\Task\Disc_Repl\Files\\'
+    ReportName = 'Discontinued Items'
+    fn.create_file(CustName, ReportName, Source, Path)
+
+    st = '\n\nStart Time: '+str(datetime.datetime.now())
+    rc = "\nReport Count = " + str(len(df1))
+def work_log(work_data):
+        #import Functions as fn
+        global i
+        querystring = ds.discsql+ work_data[1] +ds.disc2
+        querystring1 = ds.replsql+ work_data[1] +ds.repl2
+        
+        cur1.execute(querystring)
+        result = cur1.fetchall()
+        columns = [desc[0] for desc in cur1.description]
+        df2 = pd.DataFrame(list(result), columns=columns)
+        ct = len(result)
+        
+        cur1.execute(querystring1)
+        result1 = cur1.fetchall()
+        columns1 = [desc[0] for desc in cur1.description]
+        df3 = pd.DataFrame(list(result1), columns=columns1)
+        ct1 = len(result1)
+        
+        if work_data[2] == None:
+            e = None
+        else:
+             e = [x.strip() for x in work_data[2].split('; ')]
+        if work_data[3] == None:
+            cc = None
+        else:
+            cc = [x.strip() for x in work_data[3].split('; ')]
+        p2 = r'D:\ProgramData\Task\Disc_Repl\Files\\' + work_data[0] +' Discontinued Items.xlsx'
+        if ct + ct1 == 0:
+            m = account.new_message()
+            m = mailbox.new_message()
+            m.sender.address = 'email'
+            m.to.add(e)
+            m.cc.add(cc)
+            m.subject = work_data[0] +' discontinued items report has no current discontinued items'
+            m.body = work_data[0] +' discontinued items report has no current discontinued items.<br>' \
+                                    '''If you have any questions please contact your customer service.<br>'''
+            m.send()
+            i = i+1
+        else: 
+        #Apend data
+            fn.append_df_to_excel(p2, df2, sheet_name='Discontinued Items', startrow=5,truncate_sheet=False)
+            fn.append_df_to_excel(p2, df3, sheet_name='Replacements', startrow=5,truncate_sheet=False)
+        # Create Email 
+            m = account.new_message()
+            m = mailbox.new_message()
+            m.sender.address = 'email'
+            m.to.add(e)
+            m.cc.add(cc)
+            m.subject = work_data[0] +' Discontinued Items'
+            m.body = ' Attached is ' + work_data[0] + ' discontinued items.<br>' \
+                                            '''If you have any questions please contact your customer service.<br>'''
+            m.attachments.add(r'D:\ProgramData\Task\Disc_Repl\Files\\' + work_data[0] +' Discontinued Items.xlsx')
+            m.send()
+            i = i+1
+
+def pool_handler():  
+        p = Pool(3)
+        p.map(work_log, work)  
+try:
+    #Creating Dataframe for burst     
+    #Connection Setup
+    conn1 = cx_Oracle.connect(user=r'User', password='PW', dsn='DATABASE')
+    cur1 = conn1.cursor()
+    con = cx_Oracle.connect(user=r'User', password='PW', dsn='DATABASE')
+    cur = con.cursor()
+
+    u = 1 
+    if __name__ == '__main__':
+        
+        run()
+        pool_handler()
+        et ='<br>End Time: ' + str(datetime.datetime.now())
+        #f.close()
+        time.sleep(5)
+        m = account.new_message()
+        m = mailbox.new_message()
+        m.sender.address = 'emails'
+        m.to.add(['joe.mcguvery@live.com', 'john.smith@gmail.com'])
+        m.subject = "Report"
+        m.body = "Report Task Complete." + '<br>' +str(st) + '<br>' +str(rc)+ '<br>' + str(et)
+        m.send()
+        cur.execute(logsc)
+        con.commit()
+except Exception:
+    try:
+        error_message = traceback.format_exc()
+        m = account.new_message()
+        m = mailbox.new_message()
+        m.sender.address = 'emails'
+        m.to.add(['joe.mcguvery@live.com', 'john.smith@gmail.com'])
+        m.subject = "Report has an error"
+        m.body = "Error: <br>"+ str(error_message) + '<br>Error Time: ' + str(datetime.datetime.now().strftime("%m/%d/%Y, %H:%M %p"))
+        m.send()
+        cur.execute(logfl)
+        con.commit()
+    except Exception:
+        error_message = traceback.format_exc()
+        f = open('D:\ProgramData\Task\Disc_Repl\Files\Status Log.txt', 'a')
+        f.write('\n\nError Occurred\n'+ str(error_message) + 'Error Time: ' + str(datetime.datetime.now().strftime("%m/%d/%Y, %H:%M %p")))
+        f.close() 
+        cur.execute(logfl)
+        con.commit()
